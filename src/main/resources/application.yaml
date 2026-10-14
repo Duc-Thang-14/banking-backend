@@ -1,0 +1,76 @@
+spring:
+  application:
+    name: banking-system
+
+  # Cấu hình Database PostgreSQL
+  datasource:
+    url: jdbc:postgresql://localhost:5432/banking_db
+    username: postgres
+    password: password123
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      idle-timeout: 30000
+      connection-timeout: 20000
+
+  # Cấu hình JPA & Hibernate
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          batch_size: 50
+
+  # Cấu hình Flyway Migration
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+
+  # Cấu hình DevTools tự động restart khi lưu file
+  devtools:
+    restart:
+      enabled: true
+    livereload:
+      enabled: true
+
+  # Cấu hình Redis (dùng cho Cache & Distributed Lock)
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 3000ms
+
+  # Cấu hình Apache Kafka
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: banking-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+
+# Cấu hình Server
+server:
+  port: 8080
+  servlet:
+    context-path: /api/v1
+
+# Cấu hình JWT & Bảo mật
+jwt:
+  secret: 404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970
+  access-token-expiration: 86400000 # 1 ngày (ms)
+  refresh-token-expiration: 604800000 # 7 ngày (ms)
