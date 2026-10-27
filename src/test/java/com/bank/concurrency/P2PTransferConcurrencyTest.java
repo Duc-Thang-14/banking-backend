@@ -105,12 +105,12 @@ public class P2PTransferConcurrencyTest {
         long duration = System.currentTimeMillis() - startTime;
         double tps = (double) numberOfThreads / (duration / 1000.0);
 
-        System.out.println("========== KẾT QUẢ STRESS TEST ==========");
-        System.out.println("Tổng số giao dịch: " + numberOfThreads);
-        System.out.println("Thành công: " + successCount.get());
-        System.out.println("Thất bại: " + failCount.get());
-        System.out.println("Thời gian thực thi: " + duration + " ms");
-        System.out.println("TPS ước tính: " + String.format("%.2f", tps) + " req/sec");
+        System.out.println("========== KET QUA STRESS TEST ==========");
+        System.out.println("Tong so giao dich: " + numberOfThreads);
+        System.out.println("Thanh cong: " + successCount.get());
+        System.out.println("That bai: " + failCount.get());
+        System.out.println("Thoi gian thuc thi: " + duration + " ms");
+        System.out.println("TPS uoc tinh: " + String.format("%.2f", tps) + " req/sec");
         System.out.println("=========================================");
 
         Wallet finalWalletA = walletRepository.findByWalletNumber("W_TEST_A").orElseThrow();

@@ -11,28 +11,36 @@ import com.bank.enums.LedgerEntryType;
 import com.bank.enums.TransactionStatus;
 import com.bank.enums.TransactionType;
 import com.bank.enums.WalletStatus;
+import com.bank.event.TransactionEvent;
 import com.bank.exception.AppException;
 import com.bank.exception.ErrorCode;
+import com.bank.kafka.TransactionEventProducer;
 import com.bank.repository.LedgerEntryRepository;
 import com.bank.repository.TransactionRepository;
 import com.bank.repository.WalletRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class WalletService {
+
+    public static final String SYS_TREASURY_WALLET_NUMBER = "SYS_TREASURY_VND";
 
     private final WalletRepository walletRepository;
     private final TransactionRepository transactionRepository;
     private final LedgerEntryRepository ledgerEntryRepository;
     private final OtpService otpService;
+    private final TransactionEventProducer transactionEventProducer;
 
     @Transactional(readOnly = true)
     public List<WalletResponse> getWalletsByUserId(Long userId) {
@@ -50,8 +58,23 @@ public class WalletService {
 
     @Transactional
     public WalletResponse topUp(TopUpRequest request) {
-        Wallet wallet = walletRepository.findByWalletNumberWithPessimisticLock(request.getWalletNumber())
+        Wallet userMeta = walletRepository.findByWalletNumber(request.getWalletNumber())
                 .orElseThrow(() -> new AppException(ErrorCode.WALLET_NOT_FOUND, "Không tìm thấy ví: " + request.getWalletNumber()));
+        Wallet sysMeta = walletRepository.findByWalletNumber(SYS_TREASURY_WALLET_NUMBER)
+                .orElseThrow(() -> new AppException(ErrorCode.WALLET_NOT_FOUND, "Không tìm thấy Ví Kho Tiền Hệ Thống (" + SYS_TREASURY_WALLET_NUMBER + ")"));
+
+        Wallet firstLocked;
+        Wallet secondLocked;
+        if (userMeta.getId() < sysMeta.getId()) {
+            firstLocked = walletRepository.findByIdWithPessimisticLock(userMeta.getId()).orElseThrow();
+            secondLocked = walletRepository.findByIdWithPessimisticLock(sysMeta.getId()).orElseThrow();
+        } else {
+            firstLocked = walletRepository.findByIdWithPessimisticLock(sysMeta.getId()).orElseThrow();
+            secondLocked = walletRepository.findByIdWithPessimisticLock(userMeta.getId()).orElseThrow();
+        }
+
+        Wallet wallet = userMeta.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
+        Wallet systemWallet = sysMeta.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
 
         if (wallet.getStatus() != WalletStatus.ACTIVE) {
             throw new AppException(ErrorCode.WALLET_LOCKED);
@@ -62,9 +85,16 @@ public class WalletService {
         wallet.setBalance(afterBalance);
         walletRepository.save(wallet);
 
-        // 1. Tạo Transaction nạp tiền
+        BigDecimal sysBefore = systemWallet.getBalance();
+        BigDecimal sysAfter = sysBefore.subtract(request.getAmount());
+        systemWallet.setBalance(sysAfter);
+        walletRepository.save(systemWallet);
+
+        // 1. Tạo Transaction nạp tiền có nguồn gốc từ Kho Tiền Hệ Thống
+        String txRef = "TOPUP-" + UUID.randomUUID().toString().replace("-", "").substring(0, 16).toUpperCase();
         Transaction transaction = Transaction.builder()
-                .transactionReference("TOPUP-" + UUID.randomUUID().toString().replace("-", "").substring(0, 16).toUpperCase())
+                .transactionReference(txRef)
+                .sourceWallet(systemWallet)
                 .destinationWallet(wallet)
                 .amount(request.getAmount())
                 .type(TransactionType.TOP_UP)
@@ -73,7 +103,19 @@ public class WalletService {
                 .build();
         transaction = transactionRepository.save(transaction);
 
-        // 2. Ghi sổ kép (Ledger Entry: CREDIT cho ví người dùng)
+        // 2. Ghi sổ kép (Ledger Entry: DEBIT Kho Hệ Thống, CREDIT ví người dùng)
+        LedgerEntry debitSysEntry = LedgerEntry.builder()
+                .transaction(transaction)
+                .wallet(systemWallet)
+                .entryType(LedgerEntryType.DEBIT)
+                .amount(request.getAmount())
+                .balanceBefore(sysBefore)
+                .balanceAfter(sysAfter)
+                .currency(systemWallet.getCurrency())
+                .description("Xuất quỹ nạp tiền ví " + wallet.getWalletNumber())
+                .build();
+        ledgerEntryRepository.save(debitSysEntry);
+
         LedgerEntry creditEntry = LedgerEntry.builder()
                 .transaction(transaction)
                 .wallet(wallet)
@@ -82,9 +124,28 @@ public class WalletService {
                 .balanceBefore(beforeBalance)
                 .balanceAfter(afterBalance)
                 .currency(wallet.getCurrency())
-                .description("Nạp tiền vào tài khoản")
+                .description("Nạp tiền từ Kho Tiền & Bù Trừ Hệ Thống")
                 .build();
         ledgerEntryRepository.save(creditEntry);
+
+        // 3. Bắn Kafka Event kích hoạt SSE biến động số dư Real-time
+        try {
+            transactionEventProducer.publishTransactionEvent(
+                    TransactionEvent.builder()
+                            .transactionReference(txRef)
+                            .sourceWalletNumber(systemWallet.getWalletNumber())
+                            .destinationWalletNumber(wallet.getWalletNumber())
+                            .amount(request.getAmount())
+                            .currency(wallet.getCurrency())
+                            .type(TransactionType.TOP_UP)
+                            .status(TransactionStatus.SUCCESS)
+                            .description("Nạp tiền vào tài khoản thành công")
+                            .timestamp(Instant.now())
+                            .build()
+            );
+        } catch (Exception e) {
+            log.warn("Không thể gửi Kafka event cho TopUp: {}", e.getMessage());
+        }
 
         return WalletResponse.fromEntity(wallet);
     }
@@ -141,8 +202,23 @@ public class WalletService {
             otpService.verifyOtp("WITHDRAW", request.getWalletNumber(), request.getOtp());
         }
 
-        Wallet wallet = walletRepository.findByWalletNumberWithPessimisticLock(request.getWalletNumber())
-                .orElseThrow(() -> new AppException(ErrorCode.WALLET_NOT_FOUND));
+        Wallet userMeta = walletRepository.findByWalletNumber(request.getWalletNumber())
+                .orElseThrow(() -> new AppException(ErrorCode.WALLET_NOT_FOUND, "Không tìm thấy ví: " + request.getWalletNumber()));
+        Wallet sysMeta = walletRepository.findByWalletNumber(SYS_TREASURY_WALLET_NUMBER)
+                .orElseThrow(() -> new AppException(ErrorCode.WALLET_NOT_FOUND, "Không tìm thấy Ví Kho Tiền Hệ Thống (" + SYS_TREASURY_WALLET_NUMBER + ")"));
+
+        Wallet firstLocked;
+        Wallet secondLocked;
+        if (userMeta.getId() < sysMeta.getId()) {
+            firstLocked = walletRepository.findByIdWithPessimisticLock(userMeta.getId()).orElseThrow();
+            secondLocked = walletRepository.findByIdWithPessimisticLock(sysMeta.getId()).orElseThrow();
+        } else {
+            firstLocked = walletRepository.findByIdWithPessimisticLock(sysMeta.getId()).orElseThrow();
+            secondLocked = walletRepository.findByIdWithPessimisticLock(userMeta.getId()).orElseThrow();
+        }
+
+        Wallet wallet = userMeta.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
+        Wallet systemWallet = sysMeta.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
 
         if (wallet.getStatus() != WalletStatus.ACTIVE) {
             throw new AppException(ErrorCode.WALLET_LOCKED);
@@ -157,11 +233,17 @@ public class WalletService {
         wallet.setBalance(afterBalance);
         walletRepository.save(wallet);
 
-        // 1. Tạo Transaction rút tiền
+        BigDecimal sysBefore = systemWallet.getBalance();
+        BigDecimal sysAfter = sysBefore.add(request.getAmount());
+        systemWallet.setBalance(sysAfter);
+        walletRepository.save(systemWallet);
+
+        // 1. Tạo Transaction rút tiền chuyển về Kho Hệ Thống
         String txRef = "WDR-" + UUID.randomUUID().toString().replace("-", "").substring(0, 16).toUpperCase();
         Transaction transaction = Transaction.builder()
                 .transactionReference(txRef)
                 .sourceWallet(wallet)
+                .destinationWallet(systemWallet)
                 .amount(request.getAmount())
                 .fee(BigDecimal.ZERO)
                 .type(TransactionType.WITHDRAWAL)
@@ -170,7 +252,7 @@ public class WalletService {
                 .build();
         transaction = transactionRepository.save(transaction);
 
-        // 2. Ghi sổ kép Double-entry (DEBIT ví)
+        // 2. Ghi sổ kép Double-entry (DEBIT ví user, CREDIT ví hệ thống)
         LedgerEntry debitEntry = LedgerEntry.builder()
                 .transaction(transaction)
                 .wallet(wallet)
@@ -182,6 +264,37 @@ public class WalletService {
                 .description("Rút tiền về " + request.getBankName() + " - STK: " + request.getBankAccountNumber() + " (" + request.getBankAccountName() + ")")
                 .build();
         ledgerEntryRepository.save(debitEntry);
+
+        LedgerEntry creditSysEntry = LedgerEntry.builder()
+                .transaction(transaction)
+                .wallet(systemWallet)
+                .entryType(LedgerEntryType.CREDIT)
+                .amount(request.getAmount())
+                .balanceBefore(sysBefore)
+                .balanceAfter(sysAfter)
+                .currency(systemWallet.getCurrency())
+                .description("Thu hồi quỹ từ rút tiền ví " + wallet.getWalletNumber())
+                .build();
+        ledgerEntryRepository.save(creditSysEntry);
+
+        // 3. Bắn Kafka Event kích hoạt SSE biến động số dư Real-time
+        try {
+            transactionEventProducer.publishTransactionEvent(
+                    TransactionEvent.builder()
+                            .transactionReference(txRef)
+                            .sourceWalletNumber(wallet.getWalletNumber())
+                            .destinationWalletNumber(systemWallet.getWalletNumber())
+                            .amount(request.getAmount())
+                            .currency(wallet.getCurrency())
+                            .type(TransactionType.WITHDRAWAL)
+                            .status(TransactionStatus.SUCCESS)
+                            .description("Rút tiền về ngân hàng thành công")
+                            .timestamp(Instant.now())
+                            .build()
+            );
+        } catch (Exception e) {
+            log.warn("Không thể gửi Kafka event cho Withdrawal: {}", e.getMessage());
+        }
 
         return WalletResponse.fromEntity(wallet);
     }

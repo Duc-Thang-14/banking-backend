@@ -92,7 +92,7 @@ public class AuthService {
         User user = userRepository.findByUsername(request.getUsername())
                 .orElseThrow(() -> new AppException(ErrorCode.USER_NOT_FOUND));
         String walletNumber = walletRepository.findByUserId(user.getId()).stream()
-                .filter(w -> w.getWalletType() == WalletType.MAIN)
+                .filter(w -> w.getWalletType() == WalletType.MAIN || w.getWalletType() == WalletType.SYSTEM)
                 .findFirst()
                 .map(Wallet::getWalletNumber)
                 .orElse(null);
